@@ -16,8 +16,9 @@ Pillow and ReportLab into it. Nothing is installed system-wide.
 - Windows: `winget install -e --id QPDF.QPDF`
 - macOS: `brew install qpdf`
 
-Without qpdf the run still completes and the chunk PDFs are still written — they
-just are not merged, so you get several files per book instead of one.
+Without qpdf the run stops straight away with an install hint and converts
+nothing — the chunk PDFs are temporary and are only useful once merged. On
+Windows, open a new window after installing so the updated PATH is picked up.
 
 ## 2. The folder structure
 
@@ -121,9 +122,13 @@ internet. Either right-click → Open and confirm once, or run
 ## 5. What comes out
 
 One PDF per book folder, in `_Chunked_Apple_Books_PDFs/`, named after the folder.
+To save elsewhere (your Downloads folder, say): drag that folder onto
+`Convert Manga.bat`, or run `"Convert to PDF.command" ~/Downloads/Comics`, or set
+`MANGA_OUTPUT=<folder>`, or run the script directly with `-o <folder>`.
 Characters that filenames cannot contain (`< > : " / \ | ? *`) become `-`. If two
-books would produce the same filename, the second gets `(2)` appended rather than
-overwriting the first.
+books in different sources would produce the same filename, the second gets its
+source folder appended (`Series A (MangaRead).pdf`), and `(2)`, `(3)`... after
+that, rather than overwriting the first.
 
 **Re-running is safe and cheap.** A book whose PDF already exists is skipped, so
 adding one new book and running again only converts the new one. To force a
@@ -140,7 +145,9 @@ Two shapes break naive converters, and both are dealt with automatically:
 is cut into readable pages roughly 2.2× as tall as they are wide, with 100px of
 overlap so nothing is lost at the seam.
 
-**Wide spreads** — anything wider than 1.8× its height is cut into two pages.
+**Wide spreads** — anything wider than 1.8× its height is cut into pages about
+0.9× as wide as they are tall: two pages for a normal double spread, more for
+anything wider.
 
 Pages are 720pt wide, capped at 1600pt tall, and images are re-encoded as JPEG at
 quality 90. Nothing is resized to A4 and nothing is cropped: the page follows the
@@ -161,20 +168,23 @@ double-page spreads will be the wrong way round. It affects nothing else.
 
 ## 7. When something goes wrong
 
-**"Skipped (no images)"** — the book folder has no readable images, or the images
+**"Skipped (no images)"** — the book folder has no readable images, every image
+in it was rejected (unreadable, or smaller than 180px on a side), or the images
 are sitting directly in a source folder instead of inside a book folder. See §2.
 
-**Several PDFs per book instead of one** — qpdf was not found, so the chunks were
-never merged. Install it (§1) and re-run; already-finished books are skipped.
+**"ERROR: qpdf not found"** — the run stops before converting anything. Install
+it (§1), open a fresh window and re-run; already-finished books are skipped.
 
 **A page is missing from the output** — very large images are skipped rather than
 risk the run. Pillow's decompression-bomb limit is deliberately left at its
 default. To include them, set `MAX_IMAGE_PIXELS_OVERRIDE = None` near the top of
 the script. That does change the output, which is why it is not the default.
 
-**Run is slow, or the machine struggles** — worker count is capped by available
-RAM rather than by core count, because decoding images is what actually exhausts
-memory. Force a number with the `MANGA_WORKERS` environment variable:
+**Run is slow, or the machine struggles** — on Windows the worker count is
+capped by available RAM (about 2 GB per worker) rather than by core count,
+because decoding images is what actually exhausts memory; on macOS it is one per
+core, up to 16. Force a number with the `MANGA_WORKERS` environment variable
+(set it in the same Terminal/cmd window, then run the launcher from there):
 
 ```
 # Windows

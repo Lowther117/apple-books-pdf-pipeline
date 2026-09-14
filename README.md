@@ -23,7 +23,15 @@ length, and the merge is lossless.
 
 It also handles the two page shapes that break naive converters: long vertical
 strips are split horizontally into readable pages, and double-page spreads are
-split vertically into two.
+split vertically into two or more.
+
+## Which file do I use?
+
+| File | OS | What it does |
+|---|---|---|
+| `Convert Manga.bat` | Windows | Double-click. Builds `.venv` on first run, then runs the converter. |
+| `Convert to PDF.command` | macOS | Double-click. Builds `.venv-mac` on first run, then runs the converter (kept awake with `caffeinate`). |
+| `make_all_chunked_apple_books_pdfs.py` | both | The converter itself. Run it directly with any Python 3.9+ that has Pillow and ReportLab. |
 
 ## Running it
 
@@ -46,7 +54,8 @@ winget install -e --id QPDF.QPDF
 brew install qpdf
 ```
 
-Without qpdf the chunk files are still written, they just are not merged.
+Without qpdf the converter stops before doing anything and tells you how to
+install it (the chunk files are temporary and only make sense merged).
 
 ## Layout
 
@@ -68,12 +77,17 @@ again only does the new work.
 
 ## Notes
 
-- Worker count is capped by available RAM rather than core count, and workers are
-  recycled, because image decoding is what actually exhausts memory here.
+- Books are converted in parallel. On Windows the worker count is capped by
+  available RAM (about 2 GB per worker) rather than core count; on macOS it is one
+  per core, up to 16. Workers are recycled between books because image decoding
+  is what actually exhausts memory here. `MANGA_WORKERS=4` forces a number.
 - Formats read: `.jpg` `.jpeg` `.png` `.webp` `.tif` `.tiff`.
 - Nothing is resized to A4 and nothing is cropped. Page size follows the image.
 - `MANGA_ROOT` can be set as an environment variable to point somewhere other
   than the folder the script lives in.
+- Output goes to `_Chunked_Apple_Books_PDFs` by default. To save somewhere else
+  (e.g. Downloads), drop a folder onto `Convert Manga.bat` / pass it to
+  `Convert to PDF.command`, set `MANGA_OUTPUT`, or run the script with `-o FOLDER`.
 
 Only the code is in this repository. The source images and the PDFs it generates
 are excluded by `.gitignore` — they are large, and they are not mine to publish.

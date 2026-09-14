@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-make_all_chunked_apple_books_pdfs.py  (Windows port)
+make_all_chunked_apple_books_pdfs.py
 
-Faithful Windows port of the proven Mac ".command" converter. The per-book
-conversion logic is byte-for-byte identical to the original: same page
-geometry, same tall/wide splitting, same encoding, same ordering.
+One converter for both launchers ("Convert Manga.bat" on Windows, "Convert to
+PDF.command" on macOS). It grew out of the proven Mac-only converter; the
+per-book conversion logic is identical to that original: same page geometry,
+same tall/wide splitting, same encoding, same ordering.
 
 The ONLY intentional differences from the Mac original are output-neutral and
 either required on Windows or requested:
   * multiprocessing uses "spawn" (Windows has no "fork"), so all real work is
     under `if __name__ == "__main__":` with mp.freeze_support().
-  * qpdf is located on PATH or in its standard install folder (no Homebrew).
+  * qpdf is located on PATH, in its standard Windows install folders, or in
+    the Homebrew bin folders on macOS.
   * worker count is RAM-capped (CPU cores / available RAM / hard cap) instead
     of one-per-core, and workers are recycled to return memory to the OS.
   * a Windows keep-awake call replaces macOS `caffeinate`.
@@ -50,7 +52,10 @@ MANGA_ROOT = Path(os.environ.get("MANGA_ROOT", str(Path(__file__).resolve().pare
 # folder is one book -> one PDF.
 SOURCE_NAMES: list[str] = []  # e.g. ["MangaDex", "MangaRead", "ManhuaPlus"]
 
-OUTPUT_ROOT = MANGA_ROOT / "_Chunked_Apple_Books_PDFs"
+# Where the PDFs go. Default: "_Chunked_Apple_Books_PDFs" next to the sources.
+# Override with the MANGA_OUTPUT env var (the launchers pass through a folder
+# dropped on / given to them) or with --output / -o on the command line.
+OUTPUT_ROOT = Path(os.environ.get("MANGA_OUTPUT") or str(MANGA_ROOT / "_Chunked_Apple_Books_PDFs")).expanduser()
 
 # Skip books whose output PDF already exists (resume / add-new without redoing).
 SKIP_EXISTING_OUTPUT = True
@@ -118,6 +123,11 @@ def find_qpdf() -> "str | None":
     exe = shutil.which("qpdf")
     if exe:
         return exe
+
+    # macOS: a double-clicked .command may not have Homebrew on PATH.
+    for candidate in ("/opt/homebrew/bin/qpdf", "/usr/local/bin/qpdf"):
+        if os.access(candidate, os.X_OK):
+            return candidate
 
     import glob
     local = os.environ.get("LOCALAPPDATA", "")
@@ -428,7 +438,7 @@ def process_book(source_name: str, book_folder: Path, output_file: Path, qpdf_ex
     if not images:
         return ("empty", label, 0, 0.0)
 
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
 
     if output_file.exists():
         output_file.unlink()
@@ -452,6 +462,11 @@ def process_book(source_name: str, book_folder: Path, output_file: Path, qpdf_ex
             writer.close()
 
             pages = writer.total_page_count
+            if pages == 0:
+                # Every image was skipped or unreadable: a zero-page chunk
+                # would make qpdf fail, so report it as "no images" instead.
+                print(f"  EMPTY  {label}  (no usable pages)", flush=True)
+                return ("empty", label, 0, 0.0)
             print(f"  MERGE  {label}  (qpdf merging {pages} pages)...", flush=True)
             merge_chunks(qpdf_exe, writer.chunk_files, output_file)
 
@@ -502,11 +517,33 @@ def discover_books(source_folder: Path) -> list[Path]:
     return books
 
 
+def parse_args():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Convert folders of images into Apple Books-friendly PDFs (one per book)."
+    )
+    parser.add_argument(
+        "-o", "--output", metavar="FOLDER",
+        help="folder to write the PDFs into (default: _Chunked_Apple_Books_PDFs next to "
+             "the sources, or $MANGA_OUTPUT if set)",
+    )
+    return parser.parse_args()
+
+
 def main():
+    global OUTPUT_ROOT
+    args = parse_args()
+    if args.output:
+        OUTPUT_ROOT = Path(args.output).expanduser().resolve()
+
     qpdf_exe = find_qpdf()
     if qpdf_exe is None:
-        print("ERROR: qpdf not found.")
-        print("  Install it:  winget install -e --id QPDF.QPDF")
+        print("ERROR: qpdf not found. It is needed to merge the chunk PDFs, so nothing was converted.")
+        if sys.platform == "darwin":
+            print("  Install it:  brew install qpdf")
+        else:
+            print("  Install it:  winget install -e --id QPDF.QPDF")
+            print("  (then close this window and run the launcher again so the new PATH is picked up)")
         sys.exit(1)
 
     if not MANGA_ROOT.exists():
@@ -556,6 +593,7 @@ def main():
     ram_note = f"  (~{avail:.0f}GB RAM free, ~{RAM_PER_WORKER_GB:.1f}GB/worker budget)" if avail else ""
     print(f"To convert: {len(pending)}   already done (skipped): {skipped_existing}")
     print(f"Parallel workers: {workers}{ram_note}   (cores: {os.cpu_count()})")
+    print(f"Output folder: {OUTPUT_ROOT}")
     for source_name, book_folder, output_file in pending:
         print(f"  - {source_name} / {book_folder.name}  ->  {output_file.name}")
     print("#" * 80, flush=True)
