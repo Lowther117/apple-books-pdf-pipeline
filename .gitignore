@@ -1,0 +1,10 @@
+# Allowlist: ignore everything, then re-admit only the code.
+# This folder also holds the source images and the generated PDFs, which are
+# large and are not mine to publish. Nothing can be committed by accident.
+*
+
+!.gitignore
+!*.md
+!*.py
+!*.bat
+!*.command
