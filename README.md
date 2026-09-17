@@ -95,3 +95,7 @@ are excluded by `.gitignore` — they are large, and they are not mine to publis
 ---
 
 *Built for my own use, in collaboration with AI (Anthropic's Claude). I described the problems, made the decisions and tested the results; Claude wrote much of the code. Shared as-is — a personal fix, not a product. No support and no warranty.*
+
+## Licence
+
+MIT No Attribution (MIT-0): do whatever you like with it - no credit needed, no warranty. See `LICENSE`.
