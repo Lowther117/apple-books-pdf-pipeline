@@ -212,7 +212,7 @@ def set_keep_awake(enable: bool):
 
 def natural_key(path: Path):
     text = str(path).lower()
-    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", text)]
+    return [int(part) if part.isdecimal() else part for part in re.split(r"(\d+)", text)]
 
 
 def safe_filename(name: str) -> str:
@@ -420,9 +420,20 @@ def merge_chunks(qpdf_exe: str, chunk_files: list[Path], output_file: Path):
         cmd.append(str(chunk))
         cmd.append("1-z")
 
-    cmd.extend(["--", str(output_file)])
+    # Merge into a ".part" file and rename it into place only on success, so
+    # an interrupted run (Ctrl+C, closed window, power loss) can never leave a
+    # truncated PDF that the next run would skip as "already done".
+    part_file = output_file.with_name(output_file.name + ".part")
+    cmd.extend(["--", str(part_file)])
 
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL)
+        os.replace(part_file, output_file)
+    finally:
+        try:
+            part_file.unlink()
+        except OSError:
+            pass
 
 
 def process_book(source_name: str, book_folder: Path, output_file: Path, qpdf_exe: str):
@@ -563,15 +574,15 @@ def main():
     for source_folder in source_folders:
         for book_folder in discover_books(source_folder):
             filename = safe_filename(book_folder.name) + ".pdf"
-            if filename in used_names:
+            if filename.lower() in used_names:
                 filename = safe_filename(
                     f"{book_folder.name} ({source_folder.name})"
                 ) + ".pdf"
             counter = 2
-            while filename in used_names:
+            while filename.lower() in used_names:
                 filename = safe_filename(f"{book_folder.name} ({counter})") + ".pdf"
                 counter += 1
-            used_names.add(filename)
+            used_names.add(filename.lower())  # Windows/macOS names are case-insensitive
             jobs.append((source_folder.name, book_folder, OUTPUT_ROOT / filename))
 
     if not jobs:
