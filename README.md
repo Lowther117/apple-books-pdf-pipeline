@@ -79,8 +79,9 @@ again only does the new work.
 
 - Books are converted in parallel. On Windows the worker count is capped by
   available RAM (about 2 GB per worker) rather than core count; on macOS it is one
-  per core, up to 16. Workers are recycled between books because image decoding
-  is what actually exhausts memory here. `MANGA_WORKERS=4` forces a number.
+  per core, up to 16. Workers are recycled between books (on Python 3.11 or
+  newer) because image decoding is what actually exhausts memory here.
+  `MANGA_WORKERS=4` forces a number.
 - Formats read: `.jpg` `.jpeg` `.png` `.webp` `.tif` `.tiff`.
 - Nothing is resized to A4 and nothing is cropped. Page size follows the image.
 - `MANGA_ROOT` can be set as an environment variable to point somewhere other

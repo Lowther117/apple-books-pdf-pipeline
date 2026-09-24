@@ -123,7 +123,7 @@ internet. Either right-click → Open and confirm once, or run
 
 One PDF per book folder, in `_Chunked_Apple_Books_PDFs/`, named after the folder.
 To save elsewhere (your Downloads folder, say): drag that folder onto
-`Convert Manga.bat`, or run `"Convert to PDF.command" ~/Downloads/Comics`, or set
+`Convert Manga.bat`, or run `./"Convert to PDF.command" ~/Downloads/Comics`, or set
 `MANGA_OUTPUT=<folder>`, or run the script directly with `-o <folder>`.
 Characters that filenames cannot contain (`< > : " / \ | ? *`) become `-`. If two
 books in different sources would produce the same filename, the second gets its

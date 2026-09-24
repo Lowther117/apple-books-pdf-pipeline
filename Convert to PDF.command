@@ -10,7 +10,7 @@ cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" || exit 1
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 # Optional: a folder given as the first argument becomes the output folder
-# (e.g.  "Convert to PDF.command" ~/Downloads/Comics). Default is
+# (e.g.  ./"Convert to PDF.command" ~/Downloads/Comics). Default is
 # _Chunked_Apple_Books_PDFs in this folder.
 if [ -n "${1:-}" ]; then
   export MANGA_OUTPUT="$1"
