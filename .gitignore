@@ -9,3 +9,6 @@
 !*.py
 !*.bat
 !*.command
+
+# macOS Finder metadata
+.DS_Store
