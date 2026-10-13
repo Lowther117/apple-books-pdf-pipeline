@@ -98,8 +98,9 @@ Images are sorted by **natural order**, so numbers sort the way a person expects
 1.jpg, 2.jpg, 9.jpg, 10.jpg, 11.jpg      not  1, 10, 11, 2, 9
 ```
 
-The whole path is sorted, not just the filename, so `Ch.0002` reliably follows
-`Ch.0001` even when the numbering inside each chapter restarts at 1.
+The whole path is sorted folder by folder, not just the filename, so `Ch.0002`
+reliably follows `Ch.0001` even when the numbering inside each chapter restarts
+at 1, and `Ch 10` comes before `Ch 10.5`.
 
 If pages come out in the wrong order, the fix is almost always the folder or file
 names — zero-pad them (`001`, `002`) and it sorts correctly.
@@ -180,10 +181,11 @@ risk the run. Pillow's decompression-bomb limit is deliberately left at its
 default. To include them, set `MAX_IMAGE_PIXELS_OVERRIDE = None` near the top of
 the script. That does change the output, which is why it is not the default.
 
-**Run is slow, or the machine struggles** — on Windows the worker count is
-capped by available RAM (about 2 GB per worker) rather than by core count,
-because decoding images is what actually exhausts memory; on macOS it is one per
-core, up to 16. Force a number with the `MANGA_WORKERS` environment variable
+**Run is slow, or the machine struggles** — the worker count is one per core,
+up to 16, capped at about 2 GB of RAM per worker (available RAM on Windows,
+total RAM on macOS), because decoding images is what actually exhausts memory.
+If a worker crashes anyway, the run restarts the pool with one worker fewer and
+retries the unfinished books. Force a number with the `MANGA_WORKERS` environment variable
 (set it in the same Terminal/cmd window, then run the launcher from there):
 
 ```

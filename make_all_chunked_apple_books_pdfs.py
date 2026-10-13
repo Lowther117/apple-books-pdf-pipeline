@@ -19,6 +19,13 @@ either required on Windows or requested:
   * a Windows keep-awake call replaces macOS `caffeinate`.
   * a little extra progress printing.
 None of these can change a single pixel of the output PDFs.
+
+Later bug fixes that DO change output, but only for the books they affect:
+  * natural sort compares folder by folder ("Ch 10" before "Ch 10.5");
+  * the _PDFs/_CBZ/_EPUBs/_Apple_Books filters look only inside the book, so a
+    book or root folder with one of those in its name is no longer skipped;
+  * transparent PNG/WebP pages are flattened onto white instead of black.
+Opaque pages in correctly named folders come out exactly as before.
 """
 
 import os
@@ -34,6 +41,7 @@ from io import BytesIO
 from pathlib import Path
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 
 from PIL import Image, ImageOps
 from reportlab.pdfgen import canvas
@@ -149,7 +157,31 @@ def find_qpdf() -> "str | None":
 
 
 def available_ram_gb() -> float:
-    """Best-effort available physical RAM in GB (Windows via ctypes)."""
+    """Best-effort physical RAM in GB for the worker cap; 0.0 if unknown.
+
+    Windows: available RAM (GlobalMemoryStatusEx). macOS: TOTAL RAM
+    (`sysctl -n hw.memsize`), because macOS has no simple "available" figure
+    and counts compressed/cached memory as in use. Linux: MemAvailable.
+    """
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
+                                 text=True, timeout=5, stdin=subprocess.DEVNULL)
+            return int(out.stdout.strip()) / (1024 ** 3)
+        except Exception:
+            return 0.0
+    if sys.platform != "win32":
+        try:
+            with open("/proc/meminfo") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) / (1024 ** 2)
+        except Exception:
+            pass
+        try:
+            return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / (1024 ** 3)
+        except Exception:
+            return 0.0
     try:
         import ctypes
 
@@ -207,12 +239,18 @@ def set_keep_awake(enable: bool):
 
 
 # ----------------------------------------------------------------------------
-# Conversion core  (IDENTICAL to the Mac original)
+# Conversion core  (the Mac original, plus the three fixes listed at the top)
 # ----------------------------------------------------------------------------
 
 def natural_key(path: Path):
-    text = str(path).lower()
-    return [int(part) if part.isdecimal() else part for part in re.split(r"(\d+)", text)]
+    # Compare folder by folder, not as one string, so "Ch 10/001.jpg" sorts
+    # before "Ch 10.5/001.jpg" (as one string "/" vs "." put 10.5 first).
+    # re.split with a capture group always alternates text, digits, text...,
+    # so ints are only ever compared with ints and strings with strings.
+    return [
+        [int(bit) if bit.isdecimal() else bit for bit in re.split(r"(\d+)", part.lower())]
+        for part in Path(path).parts
+    ]
 
 
 def safe_filename(name: str) -> str:
@@ -230,14 +268,17 @@ def is_image(path: Path) -> bool:
     )
 
 
+def _excluded(rel: str) -> bool:
+    return any(tag in rel for tag in ("_Apple_Books", "_PDFs", "_EPUBs", "_CBZ"))
+
+
 def collect_images(book_folder: Path):
+    # The output-folder filters look only at the path INSIDE the book, so a
+    # root such as ".../My_PDFs" or a book named "Book_CBZ_fix" is not skipped.
     images = [
         p for p in book_folder.rglob("*")
         if is_image(p)
-        and "_Apple_Books" not in str(p)
-        and "_PDFs" not in str(p)
-        and "_EPUBs" not in str(p)
-        and "_CBZ" not in str(p)
+        and not _excluded(str(p.relative_to(book_folder)))
     ]
     return sorted(images, key=natural_key)
 
@@ -384,6 +425,15 @@ def add_image(writer: ChunkedPDFWriter, image_path: Path):
         with Image.open(image_path) as im:
             im = ImageOps.exif_transpose(im)
 
+            # Transparent pages: flatten onto white (a plain RGB convert turns
+            # transparent areas black). Opaque images do not take this branch.
+            if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                rgba = im.convert("RGBA")
+                flat = Image.new("RGB", rgba.size, (255, 255, 255))
+                flat.paste(rgba, mask=rgba.getchannel("A"))
+                rgba.close()
+                im = flat
+
             if im.mode not in ("RGB", "L"):
                 im = im.convert("RGB")
             elif im.mode == "L":
@@ -427,7 +477,11 @@ def merge_chunks(qpdf_exe: str, chunk_files: list[Path], output_file: Path):
     cmd.extend(["--", str(part_file)])
 
     try:
-        subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL)
+        # qpdf exits 3 when it succeeded but printed warnings (common with
+        # slightly odd input); the PDF is written, so only other codes fail.
+        result = subprocess.run(cmd, stdin=subprocess.DEVNULL)
+        if result.returncode not in (0, 3) or not part_file.exists():
+            raise subprocess.CalledProcessError(result.returncode, cmd)
         os.replace(part_file, output_file)
     finally:
         try:
@@ -492,6 +546,19 @@ def process_book(source_name: str, book_folder: Path, output_file: Path, qpdf_ex
             except OSError:
                 pass
         return ("failed", label, 0, time.perf_counter() - start)
+
+
+def _run_book(marker: str, source_name: str, book_folder: Path, output_file: Path, qpdf_exe: str):
+    """Worker entry point: process_book, with a marker file that only survives
+    if the worker process dies mid-book (so a crash can be pinned on a book)."""
+    Path(marker).touch()
+    try:
+        return process_book(source_name, book_folder, output_file, qpdf_exe)
+    finally:
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
 
 
 def discover_source_folders() -> list[Path]:
@@ -569,6 +636,14 @@ def main():
 
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
+    # Leftovers from an interrupted merge (never valid PDFs).
+    for stale in OUTPUT_ROOT.glob("*.pdf.part"):
+        try:
+            stale.unlink()
+            print(f"Removed stale partial file: {stale.name}")
+        except OSError:
+            pass
+
     jobs: list[tuple[str, Path, Path]] = []
     used_names: set[str] = set()
     for source_folder in source_folders:
@@ -601,7 +676,8 @@ def main():
 
     print("#" * 80)
     print(f"Batch: {len(jobs)} book(s) across {len(source_folders)} source folder(s)")
-    ram_note = f"  (~{avail:.0f}GB RAM free, ~{RAM_PER_WORKER_GB:.1f}GB/worker budget)" if avail else ""
+    ram_kind = "total" if sys.platform == "darwin" else "free"
+    ram_note = f"  (~{avail:.0f}GB RAM {ram_kind}, ~{RAM_PER_WORKER_GB:.1f}GB/worker budget)" if avail else ""
     print(f"To convert: {len(pending)}   already done (skipped): {skipped_existing}")
     print(f"Parallel workers: {workers}{ram_note}   (cores: {os.cpu_count()})")
     print(f"Output folder: {OUTPUT_ROOT}")
@@ -617,42 +693,92 @@ def main():
     batch_start = time.perf_counter()
 
     set_keep_awake(True)
+    marker_dir = Path(tempfile.mkdtemp(prefix="manga_pdf_"))
     try:
         ctx = mp.get_context("spawn")  # Windows has no fork
-        pool_kwargs = {"max_workers": workers, "mp_context": ctx}
+        pool_kwargs = {"mp_context": ctx}
         if TASKS_PER_WORKER and sys.version_info >= (3, 11):
             pool_kwargs["max_tasks_per_child"] = TASKS_PER_WORKER
 
-        with ProcessPoolExecutor(**pool_kwargs) as executor:
-            futures = {
-                executor.submit(process_book, s, b, o, qpdf_exe): f"{s} / {b.name}"
-                for (s, b, o) in pending
-            }
+        # A worker that dies outright (out of memory, a crash inside an image
+        # decoder) breaks the whole pool. When that happens the pool is rebuilt
+        # with one worker fewer and the unfinished books are resubmitted. Books
+        # that were mid-conversion are retried on their own first, so a book
+        # that crashes a second time is identified exactly and marked failed.
+        queue = list(enumerate(pending))
+        crashes: dict[int, int] = {}
+        pool_workers = workers
+        done_count = 0
+        total = len(pending)
+        while queue:
+            suspects = [j for j in queue if crashes.get(j[0])]
+            batch = suspects[:1] if suspects else queue
+            batch_workers = 1 if suspects else min(pool_workers, len(batch))
+            unfinished = []
 
-            done_count = 0
-            total = len(futures)
-            for future in as_completed(futures):
-                done_count += 1
-                try:
-                    status, label, pages, secs = future.result()
-                except Exception as e:
-                    label = futures[future]
-                    print(f"[{done_count}/{total}] !! crashed: {label}  ({e})")
+            with ProcessPoolExecutor(max_workers=batch_workers, **pool_kwargs) as executor:
+                futures = {
+                    executor.submit(_run_book, str(marker_dir / f"{i}.started"), s, b, o, qpdf_exe): (i, (s, b, o))
+                    for (i, (s, b, o)) in batch
+                }
+                for future in as_completed(futures):
+                    job = futures[future]
+                    s, b, o = job[1]
+                    try:
+                        status, label, pages, secs = future.result()
+                    except BrokenProcessPool:
+                        unfinished.append(job)
+                        continue
+                    except Exception as e:
+                        done_count += 1
+                        label = f"{s} / {b.name}"
+                        print(f"[{done_count}/{total}] !! crashed: {label}  ({e})")
+                        results["failed"].append(label)
+                        continue
+
+                    done_count += 1
+                    results[status].append(label)
+
+                    if status == "done":
+                        print(f"[{done_count}/{total}] OK   {label}  -  {pages} pages in {secs:.1f}s", flush=True)
+                    elif status == "skipped":
+                        print(f"[{done_count}/{total}] skip {label}  (output already exists)", flush=True)
+                    elif status == "empty":
+                        print(f"[{done_count}/{total}] --   {label}  (no images)", flush=True)
+                    else:
+                        print(f"[{done_count}/{total}] FAIL {label}", flush=True)
+
+            done_ids = {j[0] for j in batch} - {j[0] for j in unfinished}
+            queue = [j for j in queue if j[0] not in done_ids]
+            if not unfinished:
+                continue
+
+            # Which unfinished books were actually being converted when it broke?
+            running = [j for j in unfinished if (marker_dir / f"{j[0]}.started").exists()]
+            if not running:
+                running = unfinished  # cannot tell: count it against all of them
+            for j in running:
+                (marker_dir / f"{j[0]}.started").unlink(missing_ok=True)
+                crashes[j[0]] = crashes.get(j[0], 0) + 1
+            pool_workers = max(1, pool_workers - 1)
+            names = ", ".join(f"{j[1][0]} / {j[1][1].name}" for j in running)
+            print(f"!! A worker process crashed (while converting: {names}). "
+                  f"Restarting with {pool_workers} worker(s) and retrying unfinished books.", flush=True)
+            for j in running:
+                if crashes[j[0]] >= 2:
+                    done_count += 1
+                    label = f"{j[1][0]} / {j[1][1].name}"
+                    print(f"[{done_count}/{total}] FAIL {label}  (crashed the converter twice)", flush=True)
                     results["failed"].append(label)
-                    continue
-
-                results[status].append(label)
-
-                if status == "done":
-                    print(f"[{done_count}/{total}] OK   {label}  -  {pages} pages in {secs:.1f}s", flush=True)
-                elif status == "skipped":
-                    print(f"[{done_count}/{total}] skip {label}  (output already exists)", flush=True)
-                elif status == "empty":
-                    print(f"[{done_count}/{total}] --   {label}  (no images)", flush=True)
-                else:
-                    print(f"[{done_count}/{total}] FAIL {label}", flush=True)
+                    o = j[1][2]
+                    try:
+                        o.with_name(o.name + ".part").unlink()
+                    except OSError:
+                        pass
+                    queue = [q for q in queue if q[0] != j[0]]
     finally:
         set_keep_awake(False)
+        shutil.rmtree(marker_dir, ignore_errors=True)
 
     elapsed = time.perf_counter() - batch_start
 
@@ -674,6 +800,9 @@ def main():
 
     print()
     print(f"Output folder: {OUTPUT_ROOT}")
+
+    if results["failed"]:
+        sys.exit(1)  # the launchers then report "Finished with errors"
 
 
 if __name__ == "__main__":

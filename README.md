@@ -70,18 +70,24 @@ Apple Books/
 
 Every top-level folder that is not hidden, not `.venv*` and not prefixed with `_`
 is treated as a source; each folder inside it is one book, one PDF. Images are
-read in natural sort order, so `9.jpg` comes before `10.jpg`.
+read in natural sort order, so `9.jpg` comes before `10.jpg`, and `Ch 10` comes
+before `Ch 10.5`.
 
 Already-converted books are skipped on a re-run, so adding a new book and running
 again only does the new work.
 
 ## Notes
 
-- Books are converted in parallel. On Windows the worker count is capped by
-  available RAM (about 2 GB per worker) rather than core count; on macOS it is one
-  per core, up to 16. Workers are recycled between books (on Python 3.11 or
-  newer) because image decoding is what actually exhausts memory here.
-  `MANGA_WORKERS=4` forces a number.
+- Books are converted in parallel, one worker per core, up to 16, and capped by
+  RAM at about 2 GB per worker: available RAM on Windows, total RAM on macOS
+  (so a 16 GB Mac runs at most 8 workers, an 8 GB Mac at most 4). Workers are
+  recycled between books (on Python 3.11 or newer) because image decoding is
+  what actually exhausts memory here. `MANGA_WORKERS=4` forces a number.
+- If a worker process dies outright (out of memory, a crashing image decoder),
+  the run carries on with one worker fewer and retries the unfinished books; a
+  book that crashes it twice is reported as failed. Any failure makes the run
+  exit with code 1, and the launchers say "Finished with errors".
+- Transparent PNG/WebP pages are flattened onto white.
 - Formats read: `.jpg` `.jpeg` `.png` `.webp` `.tif` `.tiff`.
 - Nothing is resized to A4 and nothing is cropped. Page size follows the image.
 - `MANGA_ROOT` can be set as an environment variable to point somewhere other
