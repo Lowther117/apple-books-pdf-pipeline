@@ -126,7 +126,9 @@ One PDF per book folder, in `_Chunked_Apple_Books_PDFs/`, named after the folder
 To save elsewhere (your Downloads folder, say): drag that folder onto
 `Convert Manga.bat`, or run `./"Convert to PDF.command" ~/Downloads/Comics`, or set
 `MANGA_OUTPUT=<folder>`, or run the script directly with `-o <folder>`.
-Characters that filenames cannot contain (`< > : " / \ | ? *`) become `-`. If two
+Characters that filenames cannot contain (`< > : " / \ | ? *`) become `-`, and on
+Windows a book named after a device (`CON`, `NUL`, `COM1`...) gets a `_` added
+(`CON_.pdf`), because Windows will not save a file under that name. If two
 books in different sources would produce the same filename, the second gets its
 source folder appended (`Series A (MangaRead).pdf`), and `(2)`, `(3)`... after
 that, rather than overwriting the first.

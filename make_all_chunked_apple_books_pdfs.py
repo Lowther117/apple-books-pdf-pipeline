@@ -253,11 +253,23 @@ def natural_key(path: Path):
     ]
 
 
+_WINDOWS_DEVICE_NAMES = ({"CON", "PRN", "AUX", "NUL"}
+                         | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)})
+
+
 def safe_filename(name: str) -> str:
     bad = '<>:"/\\|?*'
     for ch in bad:
         name = name.replace(ch, "-")
-    return name.strip()
+    name = name.strip()
+    # Windows will not create a file named after a device (CON, NUL, COM1...),
+    # with any extension and with spaces before the first dot: "CON.pdf" and
+    # "nul .x.pdf" fail to save. Only those names change ("CON_.pdf").
+    if sys.platform == "win32":
+        head, dot, tail = name.partition(".")
+        if head.rstrip(" ").upper() in _WINDOWS_DEVICE_NAMES:
+            name = head + "_" + dot + tail
+    return name
 
 
 def is_image(path: Path) -> bool:
