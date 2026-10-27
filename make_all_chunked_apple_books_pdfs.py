@@ -28,9 +28,15 @@ Later bug fixes that DO change output, but only for the books they affect:
   * chapter folders sort by their chapter NUMBER when the name contains one
     ("HAMASCANS_Vol.1 Ch.4", "Chapter 1.5", "Unknown_Chapter 3"), so books
     whose chapters came from several scan groups no longer sort by group name;
-  * thin remainder strips (e.g. the 800x32 slivers Bato puts between 800x1500
-    webtoon pages) are glued onto the same-width page next to them instead of
-    being skipped, so no content is lost;
+  * images that a site has split at a fixed height (Bato caps images at 1500
+    px: a 1313x1850 manga page arrives as 1313x1500 + 1313x350, an 800x1532
+    webtoon slice as 800x1500 + 800x32) are re-joined into the original image
+    before anything else happens, so pages are whole again and the remainders
+    are no longer chopped into columns by the wide-spread rule;
+  * tall webtoon strips are cut into pages at blank gutter rows (searched back
+    from the target height) instead of at a fixed height with 100 px overlap,
+    and consecutive strips in a chapter are paged as one continuous strip.
+    Set GUTTER_CUTS = False for the old fixed cuts;
   * files that are not valid images (garbled downloads) are listed by chapter
     at the end of the run so you know what to re-download.
 Opaque pages in correctly named folders come out exactly as before.
@@ -54,7 +60,7 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageChops
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
@@ -110,6 +116,10 @@ OVERLAP_PX = 100
 WIDE_ASPECT_TRIGGER = 1.8
 WIDE_SLICE_WIDTH_AS_HEIGHT_RATIO = 0.9
 READ_WIDE_IMAGES_RIGHT_TO_LEFT = False
+# Off by default: a real double-page spread is about 1.4x as wide as tall and
+# never reaches the 1.8x trigger, so in practice this only ever chopped site
+# banners and credit strips into columns. True restores the column split.
+WIDE_SPLIT_ENABLED = False
 
 # Stability settings
 JPEG_QUALITY = 90
@@ -117,6 +127,31 @@ MAX_PDF_PAGES_PER_CHUNK = 150
 
 MIN_SLICE_HEIGHT_PX = 180
 MIN_SLICE_WIDTH_PX = 180
+
+# Re-joining site-sliced images (see rejoin_sliced). Some sites cap image
+# height and split anything taller into full-height pieces plus a remainder.
+# Within a run of consecutive same-width images in one chapter, pieces exactly
+# one of these heights followed by a shorter piece are joined back together.
+# Only applied when the pattern repeats in the run, or appears once with a
+# remainder under SLIVER_RATIO of the width (never a page of its own), so an
+# ordinary chapter of equal-height pages with one short credits page is left
+# alone.
+KNOWN_SLICE_HEIGHTS = {1500, 2000, 2500, 3000, 4000, 5000, 8000, 10000, 16383}
+SLIVER_RATIO = 0.5
+
+# Tall-strip paging (see StripPaginator). Pages are cut at the blank gutter
+# row nearest the target height, searched back to CUT_SEARCH_FRACTION of it; a
+# row counts as blank when its mean deviation from its own average is <=
+# GUTTER_BLANK_DEV (0-255) across at least GUTTER_MIN_ROWS consecutive rows.
+# With no gutter in range the cut is the old hard cut with OVERLAP_PX overlap.
+# GUTTER_CUTS = False restores the original fixed-height split_tall exactly.
+GUTTER_CUTS = True
+CUT_SEARCH_FRACTION = 0.55
+GUTTER_BLANK_DEV = 3.0
+GUTTER_SOFT_DEV = 12.0        # second tier: a quiet band (flat sky, plain wall)
+GUTTER_MIN_ROWS = 6
+GUTTER_MARGIN_ROWS = 24     # rows of the gutter left at the foot of the page
+GUTTER_SOFT_MIN_ROWS = 16
 
 # --- Windows-only knobs (do NOT affect output) ------------------------------
 # Worker count = smallest of: CPU cores, available RAM / RAM_PER_WORKER_GB,
@@ -526,7 +561,7 @@ def place_image(writer: ChunkedPDFWriter, im: Image.Image, src_name: str, stats:
 
     if aspect_tall >= TALL_ASPECT_TRIGGER:
         split_tall(writer, im, src_name)
-    elif aspect_wide >= WIDE_ASPECT_TRIGGER:
+    elif WIDE_SPLIT_ENABLED and aspect_wide >= WIDE_ASPECT_TRIGGER:
         split_wide(writer, im, src_name)
     else:
         writer.add_page(im)
@@ -539,39 +574,173 @@ def vstack(top: Image.Image, bottom: Image.Image) -> Image.Image:
     return out
 
 
-def is_thin_strip(im: Image.Image) -> bool:
-    return im.height < MIN_SLICE_HEIGHT_PX and im.width >= MIN_SLICE_WIDTH_PX
+def probe_images(images: "list[Path]", stats: dict) -> "list[tuple[Path, int, int]]":
+    """Header-only pass: (path, width, height) per readable image, with EXIF
+    rotation applied to the size. Unreadable files are recorded and dropped."""
+    out = []
+    for p in images:
+        try:
+            with Image.open(p) as im:
+                w, h = im.size
+                try:
+                    if im.getexif().get(0x0112, 1) in (5, 6, 7, 8):
+                        w, h = h, w
+                except Exception:
+                    pass
+            out.append((p, w, h))
+        except Exception as e:
+            print(f"  WARNING: could not read image: {p}")
+            print(f"  Reason: {e}")
+            stats["unreadable"].append(str(p))
+    return out
 
 
-class StripGluer:
-    """Some sources (Bato webtoons) deliver 800x1500 pages with an 800x32
-    remainder strip between each. Those strips are real content, so instead of
-    skipping them a thin strip is glued onto the same-width image before it
-    (or, if it comes first, onto the image after it). Pagination is unchanged
-    apart from the glued-on sliver. Strips of a different width still skip."""
+def group_runs(probed):
+    """Consecutive images with the same width inside the same chapter folder."""
+    runs, current = [], []
+    for item in probed:
+        if current and (item[1] != current[-1][1] or item[0].parent != current[-1][0].parent):
+            runs.append(current)
+            current = []
+        current.append(item)
+    if current:
+        runs.append(current)
+    return runs
 
-    def __init__(self, writer: ChunkedPDFWriter, stats: dict):
+
+def rejoin_sliced(run):
+    """Undo a site's fixed-height slicing. Returns a list of logical images,
+    each a list of one or more (path, w, h) pieces to stack top to bottom.
+    A logical image is: pieces exactly KNOWN_SLICE_HEIGHTS tall, then the
+    shorter remainder that follows them. Anything else stays one piece."""
+    w = run[0][1]
+    top = max(h for _, _, h in run)
+    if top not in KNOWN_SLICE_HEIGHTS or len(run) < 2:
+        return [[piece] for piece in run]
+
+    groups, joined, full = [], [], []
+    for piece in run:
+        h = piece[2]
+        if h == top:
+            full.append(piece)
+        elif full:
+            groups.append(full + [piece])
+            joined.append(len(full))
+            full = []
+        else:
+            groups.append([piece])
+    groups.extend([piece] for piece in full)
+
+    if not joined:
+        return [[piece] for piece in run]
+    if len(joined) == 1:
+        # One join only: accept it just when it is a single full piece plus a
+        # sliver, which cannot be a page of its own. Otherwise it may simply
+        # be equal-height pages followed by a short credits image.
+        grp = next(g for g in groups if len(g) > 1)
+        if not (joined[0] == 1 and grp[-1][2] / w < SLIVER_RATIO):
+            return [[piece] for piece in run]
+    return groups
+
+
+def find_gutter_cut(strip: Image.Image, target: int) -> "tuple[int, bool]":
+    """Row to cut a strip at, at most `target` rows down. Prefers the blank
+    gutter band closest to the target (fullest page) and cuts near its end;
+    returns (row, clean).
+    clean=False means no gutter was found and the caller should overlap."""
+    w, h = strip.size
+    hi = min(target, h)
+    lo = max(0, int(target * CUT_SEARCH_FRACTION))
+    if hi - lo < GUTTER_MIN_ROWS:
+        return hi, False
+    band = strip.crop((0, lo, w, hi)).convert("L")
+    n = hi - lo
+    small = band.resize((64, n), Image.BOX)
+    row_mean = small.resize((1, n), Image.BOX).resize((64, n), Image.NEAREST)
+    dev = ImageChops.difference(small, row_mean).resize((1, n), Image.BOX)
+    devs = list(dev.getdata())
+
+    def last_band(threshold: float, min_rows: int):
+        i = n - 1
+        while i >= 0:
+            if devs[i] <= threshold:
+                j = i
+                while j - 1 >= 0 and devs[j - 1] <= threshold:
+                    j -= 1
+                if i - j + 1 >= min_rows:
+                    # Cut near the END of the band so the whitespace stays at
+                    # the foot of this page and the next page opens on content.
+                    return lo + i - min(GUTTER_MARGIN_ROWS, (i - j) // 2)
+                i = j - 1
+            else:
+                i -= 1
+        return None
+
+    row = last_band(GUTTER_BLANK_DEV, GUTTER_MIN_ROWS)
+    if row is None:
+        row = last_band(GUTTER_SOFT_DEV, GUTTER_SOFT_MIN_ROWS)
+    if row is None:
+        return hi, False
+    return row, True
+
+
+class StripPaginator:
+    """Re-pages a webtoon strip. Pieces are pushed in reading order and stitched
+    into a rolling buffer; whenever the buffer reaches the target page height
+    (TALL_SLICE_HEIGHT_AS_WIDTH_RATIO x width, capped by the PDF page ratio) a
+    page is cut off the top at the nearest blank gutter row. Nothing is lost: a
+    trailing sliver too short for a page of its own is added to the last page.
+    """
+
+    def __init__(self, writer: ChunkedPDFWriter, stats: dict, label: str):
         self.writer = writer
         self.stats = stats
-        self.pending: "Image.Image | None" = None
-        self.pending_name = ""
+        self.label = label
+        self.buf: "Image.Image | None" = None
+        self.last: "Image.Image | None" = None   # last cut page, not yet written
+        self.pages = 0
 
-    def push(self, im: Image.Image, name: str):
-        if self.pending is not None and im.width == self.pending.width and (
-            is_thin_strip(im) or is_thin_strip(self.pending)
-        ):
-            self.pending = vstack(self.pending, im)
-            self.pending_name = f"{self.pending_name}+{name}"
-            self.stats["strips_glued"] += 1
-            return
-        self.flush()
-        self.pending, self.pending_name = im, name
+    def _targets(self):
+        w = self.buf.width
+        max_h = int(w * (PDF_MAX_PAGE_HEIGHT / PDF_PAGE_WIDTH))
+        return min(int(w * TALL_SLICE_HEIGHT_AS_WIDTH_RATIO), max_h), max_h
+
+    def push(self, im: Image.Image):
+        self.buf = im if self.buf is None else vstack(self.buf, im)
+        target, _ = self._targets()
+        while self.buf.height >= target:
+            self._cut(target)
+
+    def _cut(self, target: int):
+        w, h = self.buf.size
+        row, clean = find_gutter_cut(self.buf, target)
+        self._queue(self.buf.crop((0, 0, w, row)))
+        self.stats["clean_cuts" if clean else "hard_cuts"] += 1
+        keep_from = row if clean else max(0, row - OVERLAP_PX)
+        self.buf = self.buf.crop((0, keep_from, w, h))
+
+    def _queue(self, page: Image.Image):
+        if self.last is not None:
+            self.writer.add_page(self.last)
+            self.pages += 1
+        self.last = page
 
     def flush(self):
-        if self.pending is not None:
-            place_image(self.writer, self.pending, self.pending_name, self.stats)
-            self.pending = None
-            self.pending_name = ""
+        if self.buf is not None:
+            _, max_h = self._targets()
+            while self.buf.height > max_h:
+                self._cut(max_h)
+            rem = self.buf
+            self.buf = None
+            if rem.height >= MIN_SLICE_HEIGHT_PX or self.last is None:
+                self._queue(rem)
+            else:
+                # Too short for a page of its own: tack it onto the last page.
+                self.last = vstack(self.last, rem)
+        if self.last is not None:
+            self.writer.add_page(self.last)
+            self.pages += 1
+            self.last = None
 
 
 def merge_chunks(qpdf_exe: str, chunk_files: list[Path], output_file: Path):
@@ -608,7 +777,8 @@ def process_book(source_name: str, book_folder: Path, output_file: Path, qpdf_ex
     """Convert a single book folder into one Apple Books PDF (worker process)."""
     label = f"{source_name} / {book_folder.name}"
     start = time.perf_counter()
-    stats = {"unreadable": [], "tiny_skipped": [], "strips_glued": 0}
+    stats = {"unreadable": [], "tiny_skipped": [], "rejoined": 0,
+             "strip_pages": 0, "clean_cuts": 0, "hard_cuts": 0}
 
     if output_file.exists() and SKIP_EXISTING_OUTPUT:
         return ("skipped", label, 0, 0.0, stats)
@@ -630,20 +800,49 @@ def process_book(source_name: str, book_folder: Path, output_file: Path, qpdf_ex
             chunk_dir = Path(temp) / "chunks"
             writer = ChunkedPDFWriter(chunk_dir)
 
-            total = len(images)
-            gluer = StripGluer(writer, stats)
-            for index, image_path in enumerate(images, start=1):
-                im = load_image(image_path, stats)
-                if im is not None:
-                    gluer.push(im, image_path.name)
+            probed = probe_images(images, stats)
+            runs = group_runs(probed)
+            total = len(probed)
+            index = 0
+            for run in runs:
+                logical = rejoin_sliced(run)
+                rejoined_here = sum(1 for g in logical if len(g) > 1)
+                if rejoined_here:
+                    stats["rejoined"] += rejoined_here
+                    print(f"  Rejoined {rejoined_here} site-split image(s) in "
+                          f"{label} / {run[0][0].parent.name}", flush=True)
+                pager = None
+                for pieces in logical:
+                    index += len(pieces)
+                    parts = [load_image(p, stats) for p, _, _ in pieces]
+                    parts = [im for im in parts if im is not None]
+                    if not parts:
+                        continue
+                    im = parts[0]
+                    for extra in parts[1:]:
+                        im = vstack(im, extra)
+                    name = "+".join(p.name for p, _, _ in pieces)
 
-                if index % 50 == 0:
-                    gc.collect()
-                if index % PROGRESS_EVERY == 0 or index == total:
-                    print(f"   ....  {label}: {index}/{total} images, "
-                          f"{writer.total_page_count} pages", flush=True)
+                    if GUTTER_CUTS and im.height / im.width >= TALL_ASPECT_TRIGGER:
+                        if pager is None:
+                            pager = StripPaginator(writer, stats, label)
+                        pager.push(im)
+                    else:
+                        if pager is not None:
+                            pager.flush()
+                            stats["strip_pages"] += pager.pages
+                            pager = None
+                        place_image(writer, im, name, stats)
 
-            gluer.flush()
+                    if index % 50 == 0:
+                        gc.collect()
+                    if index % PROGRESS_EVERY < len(pieces) or index == total:
+                        print(f"   ....  {label}: {index}/{total} images, "
+                              f"{writer.total_page_count} pages", flush=True)
+                if pager is not None:
+                    pager.flush()
+                    stats["strip_pages"] += pager.pages
+
             writer.close()
 
             pages = writer.total_page_count
@@ -920,12 +1119,16 @@ def main():
         for item in results["failed"]:
             print(f"  - {item}")
 
-    glued = sum(st["strips_glued"] for st in book_stats.values())
+    rejoined = sum(st["rejoined"] for st in book_stats.values())
+    spages = sum(st["strip_pages"] for st in book_stats.values())
+    clean = sum(st["clean_cuts"] for st in book_stats.values())
+    hard = sum(st["hard_cuts"] for st in book_stats.values())
     tiny = sum(len(st["tiny_skipped"]) for st in book_stats.values())
-    if glued or tiny:
+    if rejoined or spages or tiny:
         print()
-        print(f"Thin strips glued onto neighbouring pages: {glued}   "
-              f"tiny images skipped (no same-width neighbour): {tiny}")
+        print(f"Site-split images re-joined: {rejoined}   "
+              f"tall strips paged: {spages} pages ({clean} at blank gutters, {hard} hard cuts)   "
+              f"tiny images skipped: {tiny}")
 
     unreadable = [(label, st["unreadable"]) for label, st in book_stats.items() if st["unreadable"]]
     if unreadable:

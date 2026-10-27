@@ -96,10 +96,17 @@ again only does the new work.
   book that crashes it twice is reported as failed. Any failure makes the run
   exit with code 1, and the launchers say "Finished with errors".
 - Transparent PNG/WebP pages are flattened onto white.
-- Thin remainder strips (the 800x32 slivers some sites put between 800x1500
-  webtoon pages) are glued onto the same-width page next to them rather than
-  dropped. Anything under 180 px in both directions with no same-width
-  neighbour is still skipped.
+- Images a site has split at a fixed height are re-joined first. Bato caps
+  images at 1500 px, so a 1313x1850 manga page arrives as 1313x1500 + 1313x350
+  and an 800x1532 webtoon slice as 800x1500 + 800x32; the pieces are stacked
+  back into the original image before any page logic runs.
+- Tall webtoon strips are cut into pages at blank gutter rows, searched back
+  from the target height, and consecutive strips in a chapter are paged as one
+  continuous strip. Where there is no gutter the old fixed cut with 100 px of
+  overlap is used. `GUTTER_CUTS = False` restores the fixed cuts.
+- The wide-spread column split is off by default (`WIDE_SPLIT_ENABLED`): a real
+  spread is about 1.4x as wide as tall and never hit the 1.8x trigger, so in
+  practice it only chopped site banners into columns.
 - Files that are not valid images (garbled downloads) are skipped and listed by
   book and chapter at the end of the run, so you know what to re-download.
 - Formats read: `.jpg` `.jpeg` `.png` `.webp` `.tif` `.tiff`.

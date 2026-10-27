@@ -130,12 +130,25 @@ you can delete the one you do not want.
 If pages still come out in the wrong order, the fix is almost always the folder or
 file names — zero-pad them (`001`, `002`) and it sorts correctly.
 
-**Thin strips are glued, not dropped.** Some sites (Bato in particular) deliver
-webtoons as 800x1500 pages with an 800x32 remainder strip after each one. Those
-strips are a sliver of real artwork, so a strip is glued onto the bottom of the
-same-width image before it (or the top of the one after it if it comes first).
-The run's summary says how many were glued. An image under 180 px tall and wide
-with no same-width neighbour is still skipped, with a warning.
+**Site-split images are re-joined.** Bato caps every image at 1500 px tall and
+splits anything taller into a 1500 px piece plus the remainder, so a 1313x1850
+manga page turns up as `003.webp` (1313x1500) and `004.webp` (1313x350), and an
+800x1532 webtoon slice as 800x1500 + 800x32. Left as they are, the remainders
+become stray short pages (or, with the old wide-spread rule, get chopped into
+columns) and every page is cut in half. The converter spots the pattern - pieces
+exactly 1500 px tall (or another common cap) followed by a shorter piece, in the
+same chapter and the same width - stacks them back into the original image, and
+only then decides how to page it. The log says how many were re-joined per
+chapter. An ordinary chapter of equal-height pages with one short credits image
+at the end is deliberately left alone.
+
+**Tall webtoon strips are cut at gutters.** A strip more than 2.8x as tall as it
+is wide is paged at about 2.2x its width, and each cut is placed at the blank
+row band nearest that height (searched back to 55% of it), so panels and speech
+bubbles are not sliced through. Consecutive strips in a chapter are paged as one
+continuous strip. Where a stretch of art has no gutter at all, the old fixed cut
+with 100 px of overlap is used instead; the summary counts both kinds.
+`GUTTER_CUTS = False` at the top of the script gives the original fixed cuts.
 
 **File types read:** `.jpg` `.jpeg` `.png` `.webp` `.tif` `.tiff`. Anything else in
 the folder is ignored, so stray `.txt`, `.nfo` or `.zip` files do no harm.
@@ -187,6 +200,14 @@ anything wider.
 Pages are 720pt wide, capped at 1600pt tall, and images are re-encoded as JPEG at
 quality 90. Nothing is resized to A4 and nothing is cropped: the page follows the
 image.
+
+### Wide images
+
+The column split for very wide images (`WIDE_SPLIT_ENABLED`) is off by default.
+A genuine double-page spread is about 1.4x as wide as tall and never reached the
+1.8x trigger, so in practice the rule only ever chopped site banners and credit
+strips into three to five columns. A wide image is now simply a short landscape
+page. Set `WIDE_SPLIT_ENABLED = True` to get the columns back.
 
 ### The one setting manga readers will want
 
