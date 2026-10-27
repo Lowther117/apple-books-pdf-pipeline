@@ -24,8 +24,19 @@ Later bug fixes that DO change output, but only for the books they affect:
   * natural sort compares folder by folder ("Ch 10" before "Ch 10.5");
   * the _PDFs/_CBZ/_EPUBs/_Apple_Books filters look only inside the book, so a
     book or root folder with one of those in its name is no longer skipped;
-  * transparent PNG/WebP pages are flattened onto white instead of black.
+  * transparent PNG/WebP pages are flattened onto white instead of black;
+  * chapter folders sort by their chapter NUMBER when the name contains one
+    ("HAMASCANS_Vol.1 Ch.4", "Chapter 1.5", "Unknown_Chapter 3"), so books
+    whose chapters came from several scan groups no longer sort by group name;
+  * thin remainder strips (e.g. the 800x32 slivers Bato puts between 800x1500
+    webtoon pages) are glued onto the same-width page next to them instead of
+    being skipped, so no content is lost;
+  * files that are not valid images (garbled downloads) are listed by chapter
+    at the end of the run so you know what to re-download.
 Opaque pages in correctly named folders come out exactly as before.
+
+The sources may sit directly beside this script, or inside a "mangas" subfolder
+(as the Mihon/Tachiyomi-style downloaders lay them out); both are detected.
 """
 
 import os
@@ -51,9 +62,12 @@ from reportlab.lib.utils import ImageReader
 # ----------------------------------------------------------------------------
 # Batch configuration  (identical to the original unless noted)
 # ----------------------------------------------------------------------------
-# Root that contains the per-source folders. On Windows this defaults to the
-# folder this script lives in (the .bat does not set MANGA_ROOT).
-MANGA_ROOT = Path(os.environ.get("MANGA_ROOT", str(Path(__file__).resolve().parent)))
+# Root that contains the per-source folders (Source / Book / [Chapter] / images).
+# Defaults to the "mangas" subfolder next to this script when one exists, else
+# the folder this script lives in. Override with the MANGA_ROOT env var.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_DEFAULT_ROOT = _SCRIPT_DIR / "mangas" if (_SCRIPT_DIR / "mangas").is_dir() else _SCRIPT_DIR
+MANGA_ROOT = Path(os.environ.get("MANGA_ROOT", str(_DEFAULT_ROOT)))
 
 # Leave empty to auto-detect every top-level folder under MANGA_ROOT (ignoring
 # hidden, ".venv", and "_..." folders). Each immediate subfolder of a source
@@ -63,13 +77,16 @@ SOURCE_NAMES: list[str] = []  # e.g. ["MangaDex", "MangaRead", "ManhuaPlus"]
 # Where the PDFs go. Default: "_Chunked_Apple_Books_PDFs" next to the sources.
 # Override with the MANGA_OUTPUT env var (the launchers pass through a folder
 # dropped on / given to them) or with --output / -o on the command line.
-OUTPUT_ROOT = Path(os.environ.get("MANGA_OUTPUT") or str(MANGA_ROOT / "_Chunked_Apple_Books_PDFs")).expanduser()
+# When the root is the auto-detected "mangas" subfolder the PDFs go next to the
+# script, not inside "mangas".
+_OUTPUT_PARENT = _SCRIPT_DIR if MANGA_ROOT == _SCRIPT_DIR / "mangas" else MANGA_ROOT
+OUTPUT_ROOT = Path(os.environ.get("MANGA_OUTPUT") or str(_OUTPUT_PARENT / "_Chunked_Apple_Books_PDFs")).expanduser()
 
 # Skip books whose output PDF already exists (resume / add-new without redoing).
 SKIP_EXISTING_OUTPUT = True
 
 # Folders never treated as a source or a book.
-IGNORED_TOP_LEVEL = {".venv"}
+IGNORED_TOP_LEVEL = {".venv", ".venv-mac", "thumbnails"}  # "thumbnails": downloader covers
 
 IMAGE_EXTENSIONS = {
     ".jpg",
@@ -284,6 +301,44 @@ def _excluded(rel: str) -> bool:
     return any(tag in rel for tag in ("_Apple_Books", "_PDFs", "_EPUBs", "_CBZ"))
 
 
+# Chapter number inside a folder name: "Chapter 12", "Ch.12.5", "Unknown_Chapter 3",
+# "HAMASCANS_Vol.1 Ch.4 - Title". The lookbehind stops "Schale"/"Chamber" matching.
+_CHAPTER_RE = re.compile(r"(?<![a-z])ch(?:apter)?\.?\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+
+
+def chapter_number(folder_name: str) -> "float | None":
+    m = _CHAPTER_RE.search(folder_name)
+    return float(m.group(1)) if m else None
+
+
+def reading_order_key(rel: Path):
+    """Sort key for a path relative to the book folder. A folder whose name
+    carries a chapter number sorts by that number (so "Group_Vol.3 Ch.15" sorts
+    by 15, not by the group's name); everything else keeps natural order.
+    Each element is (kind, chapter, natural) so ints never meet strings."""
+    key = []
+    for part in rel.parts[:-1]:
+        ch = chapter_number(part)
+        key.append((0, ch, natural_key(Path(part))) if ch is not None
+                   else (1, 0.0, natural_key(Path(part))))
+    key.append((1, 0.0, natural_key(Path(rel.parts[-1]))))
+    return key
+
+
+def warn_duplicate_chapters(book_folder: Path):
+    """The same chapter from two scan groups: both are kept, back to back."""
+    seen: dict[float, list[str]] = {}
+    for entry in book_folder.iterdir():
+        if entry.is_dir() and not entry.name.startswith("."):
+            ch = chapter_number(entry.name)
+            if ch is not None:
+                seen.setdefault(ch, []).append(entry.name)
+    for ch, names in sorted(seen.items()):
+        if len(names) > 1:
+            print(f"  WARNING: {book_folder.name}: chapter {ch:g} appears {len(names)} times "
+                  f"(all kept, back to back): " + " | ".join(sorted(names)), flush=True)
+
+
 def collect_images(book_folder: Path):
     # The output-folder filters look only at the path INSIDE the book, so a
     # root such as ".../My_PDFs" or a book named "Book_CBZ_fix" is not skipped.
@@ -292,7 +347,7 @@ def collect_images(book_folder: Path):
         if is_image(p)
         and not _excluded(str(p.relative_to(book_folder)))
     ]
-    return sorted(images, key=natural_key)
+    return sorted(images, key=lambda p: reading_order_key(p.relative_to(book_folder)))
 
 
 class ChunkedPDFWriter:
@@ -432,10 +487,13 @@ def split_wide(writer: ChunkedPDFWriter, im: Image.Image, src_name: str):
         crop.close()
 
 
-def add_image(writer: ChunkedPDFWriter, image_path: Path):
+def load_image(image_path: Path, stats: dict) -> "Image.Image | None":
+    """Open, EXIF-rotate, flatten transparency onto white and convert to RGB.
+    Returns None (and records the file) if it is not a readable image."""
     try:
-        with Image.open(image_path) as im:
-            im = ImageOps.exif_transpose(im)
+        with Image.open(image_path) as src:
+            src.load()
+            im = ImageOps.exif_transpose(src)
 
             # Transparent pages: flatten onto white (a plain RGB convert turns
             # transparent areas black). Opaque images do not take this branch.
@@ -446,30 +504,74 @@ def add_image(writer: ChunkedPDFWriter, image_path: Path):
                 rgba.close()
                 im = flat
 
-            if im.mode not in ("RGB", "L"):
-                im = im.convert("RGB")
-            elif im.mode == "L":
-                im = im.convert("RGB")
-
-            width, height = im.size
-
-            if width < MIN_SLICE_WIDTH_PX or height < MIN_SLICE_HEIGHT_PX:
-                print(f"  WARNING: skipping tiny source image {image_path.name} ({width}x{height})")
-                return
-
-            aspect_tall = height / width
-            aspect_wide = width / height
-
-            if aspect_tall >= TALL_ASPECT_TRIGGER:
-                split_tall(writer, im, image_path.name)
-            elif aspect_wide >= WIDE_ASPECT_TRIGGER:
-                split_wide(writer, im, image_path.name)
-            else:
-                writer.add_page(im)
-
+            return im.convert("RGB")
     except Exception as e:
-        print(f"  WARNING: could not process image: {image_path}")
+        print(f"  WARNING: could not read image: {image_path}")
         print(f"  Reason: {e}")
+        stats["unreadable"].append(str(image_path))
+        return None
+
+
+def place_image(writer: ChunkedPDFWriter, im: Image.Image, src_name: str, stats: dict):
+    """The original per-image geometry logic: tall split / wide split / one page."""
+    width, height = im.size
+
+    if width < MIN_SLICE_WIDTH_PX or height < MIN_SLICE_HEIGHT_PX:
+        print(f"  WARNING: skipping tiny source image {src_name} ({width}x{height})")
+        stats["tiny_skipped"].append(src_name)
+        return
+
+    aspect_tall = height / width
+    aspect_wide = width / height
+
+    if aspect_tall >= TALL_ASPECT_TRIGGER:
+        split_tall(writer, im, src_name)
+    elif aspect_wide >= WIDE_ASPECT_TRIGGER:
+        split_wide(writer, im, src_name)
+    else:
+        writer.add_page(im)
+
+
+def vstack(top: Image.Image, bottom: Image.Image) -> Image.Image:
+    out = Image.new("RGB", (top.width, top.height + bottom.height), (255, 255, 255))
+    out.paste(top, (0, 0))
+    out.paste(bottom, (0, top.height))
+    return out
+
+
+def is_thin_strip(im: Image.Image) -> bool:
+    return im.height < MIN_SLICE_HEIGHT_PX and im.width >= MIN_SLICE_WIDTH_PX
+
+
+class StripGluer:
+    """Some sources (Bato webtoons) deliver 800x1500 pages with an 800x32
+    remainder strip between each. Those strips are real content, so instead of
+    skipping them a thin strip is glued onto the same-width image before it
+    (or, if it comes first, onto the image after it). Pagination is unchanged
+    apart from the glued-on sliver. Strips of a different width still skip."""
+
+    def __init__(self, writer: ChunkedPDFWriter, stats: dict):
+        self.writer = writer
+        self.stats = stats
+        self.pending: "Image.Image | None" = None
+        self.pending_name = ""
+
+    def push(self, im: Image.Image, name: str):
+        if self.pending is not None and im.width == self.pending.width and (
+            is_thin_strip(im) or is_thin_strip(self.pending)
+        ):
+            self.pending = vstack(self.pending, im)
+            self.pending_name = f"{self.pending_name}+{name}"
+            self.stats["strips_glued"] += 1
+            return
+        self.flush()
+        self.pending, self.pending_name = im, name
+
+    def flush(self):
+        if self.pending is not None:
+            place_image(self.writer, self.pending, self.pending_name, self.stats)
+            self.pending = None
+            self.pending_name = ""
 
 
 def merge_chunks(qpdf_exe: str, chunk_files: list[Path], output_file: Path):
@@ -506,15 +608,17 @@ def process_book(source_name: str, book_folder: Path, output_file: Path, qpdf_ex
     """Convert a single book folder into one Apple Books PDF (worker process)."""
     label = f"{source_name} / {book_folder.name}"
     start = time.perf_counter()
+    stats = {"unreadable": [], "tiny_skipped": [], "strips_glued": 0}
 
     if output_file.exists() and SKIP_EXISTING_OUTPUT:
-        return ("skipped", label, 0, 0.0)
+        return ("skipped", label, 0, 0.0, stats)
 
     images = collect_images(book_folder)
 
     if not images:
-        return ("empty", label, 0, 0.0)
+        return ("empty", label, 0, 0.0, stats)
 
+    warn_duplicate_chapters(book_folder)
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     if output_file.exists():
@@ -527,8 +631,11 @@ def process_book(source_name: str, book_folder: Path, output_file: Path, qpdf_ex
             writer = ChunkedPDFWriter(chunk_dir)
 
             total = len(images)
+            gluer = StripGluer(writer, stats)
             for index, image_path in enumerate(images, start=1):
-                add_image(writer, image_path)
+                im = load_image(image_path, stats)
+                if im is not None:
+                    gluer.push(im, image_path.name)
 
                 if index % 50 == 0:
                     gc.collect()
@@ -536,6 +643,7 @@ def process_book(source_name: str, book_folder: Path, output_file: Path, qpdf_ex
                     print(f"   ....  {label}: {index}/{total} images, "
                           f"{writer.total_page_count} pages", flush=True)
 
+            gluer.flush()
             writer.close()
 
             pages = writer.total_page_count
@@ -543,12 +651,12 @@ def process_book(source_name: str, book_folder: Path, output_file: Path, qpdf_ex
                 # Every image was skipped or unreadable: a zero-page chunk
                 # would make qpdf fail, so report it as "no images" instead.
                 print(f"  EMPTY  {label}  (no usable pages)", flush=True)
-                return ("empty", label, 0, 0.0)
+                return ("empty", label, 0, 0.0, stats)
             print(f"  MERGE  {label}  (qpdf merging {pages} pages)...", flush=True)
             merge_chunks(qpdf_exe, writer.chunk_files, output_file)
 
         secs = time.perf_counter() - start
-        return ("done", label, pages, secs)
+        return ("done", label, pages, secs, stats)
 
     except Exception as e:
         print(f"ERROR while processing {label}: {e}")
@@ -557,7 +665,7 @@ def process_book(source_name: str, book_folder: Path, output_file: Path, qpdf_ex
                 output_file.unlink()
             except OSError:
                 pass
-        return ("failed", label, 0, time.perf_counter() - start)
+        return ("failed", label, 0, time.perf_counter() - start, stats)
 
 
 def _run_book(marker: str, source_name: str, book_folder: Path, output_file: Path, qpdf_exe: str):
@@ -702,6 +810,7 @@ def main():
         return
 
     results = {"done": [], "skipped": [], "empty": [], "failed": []}
+    book_stats: dict[str, dict] = {}
     batch_start = time.perf_counter()
 
     set_keep_awake(True)
@@ -737,7 +846,7 @@ def main():
                     job = futures[future]
                     s, b, o = job[1]
                     try:
-                        status, label, pages, secs = future.result()
+                        status, label, pages, secs, stats = future.result()
                     except BrokenProcessPool:
                         unfinished.append(job)
                         continue
@@ -750,6 +859,7 @@ def main():
 
                     done_count += 1
                     results[status].append(label)
+                    book_stats[label] = stats
 
                     if status == "done":
                         print(f"[{done_count}/{total}] OK   {label}  -  {pages} pages in {secs:.1f}s", flush=True)
@@ -809,6 +919,26 @@ def main():
         print("The following books failed and were not written:")
         for item in results["failed"]:
             print(f"  - {item}")
+
+    glued = sum(st["strips_glued"] for st in book_stats.values())
+    tiny = sum(len(st["tiny_skipped"]) for st in book_stats.values())
+    if glued or tiny:
+        print()
+        print(f"Thin strips glued onto neighbouring pages: {glued}   "
+              f"tiny images skipped (no same-width neighbour): {tiny}")
+
+    unreadable = [(label, st["unreadable"]) for label, st in book_stats.items() if st["unreadable"]]
+    if unreadable:
+        print()
+        print("!" * 80)
+        print("UNREADABLE FILES - these are not valid images (corrupt or garbled downloads).")
+        print("The PDFs were written WITHOUT these pages. Re-download the chapters listed:")
+        for label, files in unreadable:
+            chapters = sorted({Path(f).parent.name for f in files})
+            print(f"  - {label}: {len(files)} file(s) in {', '.join(chapters)}")
+            for f in files:
+                print(f"        {Path(f).parent.name}/{Path(f).name}")
+        print("!" * 80)
 
     print()
     print(f"Output folder: {OUTPUT_ROOT}")

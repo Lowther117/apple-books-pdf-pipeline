@@ -66,6 +66,23 @@ MangaDex/
 
 All of that becomes one `Series A.pdf`, with the chapters in order.
 
+**A `mangas` folder is also fine.** Downloaders such as Mihon/Tachiyomi put the
+sources inside a `mangas` folder next to a `thumbnails` folder. If the script finds
+a `mangas` folder beside it, it reads the sources from in there, ignores
+`thumbnails`, and still writes the PDFs next to the script:
+
+```
+Apple Books/
+├── make_all_chunked_apple_books_pdfs.py
+├── mangas/
+│   ├── MangaDex (EN)/
+│   │   └── Series A/...
+│   └── Bato (EN)/
+│       └── Series B/...
+├── thumbnails/                      <- ignored
+└── _Chunked_Apple_Books_PDFs/       <- output
+```
+
 ### What gets skipped
 
 Folders are ignored at either level if they:
@@ -102,8 +119,23 @@ The whole path is sorted folder by folder, not just the filename, so `Ch.0002`
 reliably follows `Ch.0001` even when the numbering inside each chapter restarts
 at 1, and `Ch 10` comes before `Ch 10.5`.
 
-If pages come out in the wrong order, the fix is almost always the folder or file
-names — zero-pad them (`001`, `002`) and it sorts correctly.
+**Chapter folders sort by chapter number** when the folder name has one in it:
+`Chapter 12`, `Ch.12.5`, `Unknown_Chapter 3`, `HAMASCANS_Vol.1 Ch.4 - Title` all
+count. This matters for MangaDex-style downloads, where the folder starts with the
+scan group's name — without it, a book translated by three groups would read in
+group order, not chapter order. If the same chapter number turns up twice (two
+groups did it), both are kept, one after the other, and a warning names them so
+you can delete the one you do not want.
+
+If pages still come out in the wrong order, the fix is almost always the folder or
+file names — zero-pad them (`001`, `002`) and it sorts correctly.
+
+**Thin strips are glued, not dropped.** Some sites (Bato in particular) deliver
+webtoons as 800x1500 pages with an 800x32 remainder strip after each one. Those
+strips are a sliver of real artwork, so a strip is glued onto the bottom of the
+same-width image before it (or the top of the one after it if it comes first).
+The run's summary says how many were glued. An image under 180 px tall and wide
+with no same-width neighbour is still skipped, with a warning.
 
 **File types read:** `.jpg` `.jpeg` `.png` `.webp` `.tif` `.tiff`. Anything else in
 the folder is ignored, so stray `.txt`, `.nfo` or `.zip` files do no harm.
@@ -177,6 +209,12 @@ are sitting directly in a source folder instead of inside a book folder. See §2
 
 **"ERROR: qpdf not found"** — the run stops before converting anything. Install
 it (§1), open a fresh window and re-run; already-finished books are skipped.
+
+**"UNREADABLE FILES" block at the end of the run** — those files have an image
+extension but are not images (no JPEG/PNG/WebP header; usually a download that
+came down garbled). Nothing can recover them. Re-download the chapters listed,
+delete that book's PDF from `_Chunked_Apple_Books_PDFs`, and run again — only
+that book is redone.
 
 **A page is missing from the output** — very large images are skipped rather than
 risk the run. Pillow's decompression-bomb limit is deliberately left at its
